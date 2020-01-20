@@ -9,6 +9,12 @@ const {
   objectToDottedField,
   liftResolvedFields,
 } = require(`../db/common/query`)
+const {
+  ensureIndexByTypedChain,
+  getNodesByTypedChain,
+  addResolvedNodes,
+  getNode,
+} = require(`./nodes`)
 
 /////////////////////////////////////////////////////////////////////
 // Parse filter
@@ -110,6 +116,98 @@ function handleMany(siftArgs, nodes, sort, resolvedFields) {
 }
 
 /**
+ * Given an object, assert that it has exactly one leaf property and that this
+ * leaf is a number, string, or boolean. Additionally confirms that the path
+ * does not contain the special cased `elemMatch` name.
+ * Returns undefined if not a flat path, if it contains `elemMatch`, or if the
+ * leaf value was not a bool, number, or string.
+ * If array, it contains the property path followed by the leaf value.
+ *
+ * Example: `{a: {b: {c: "x"}}}` is flat with a chain of `['a', 'b', 'c', 'x']`
+ * Example: `{a: {b: "x", c: "y"}}` is not flat because x and y are 2 leafs
+ *
+ * @param {Object} obj
+ * @returns {Array<string | number | boolean>|undefined}
+ */
+const getFlatPropertyChain = obj => {
+  if (!obj) {
+    return undefined
+  }
+
+  let chain = []
+  let props = Object.getOwnPropertyNames(obj)
+  let next = obj
+  while (props.length === 1) {
+    const prop = props[0]
+    if (prop === `elemMatch`) {
+      // TODO: Support handling this special case without sift as well
+      return undefined
+    }
+    chain.push(prop)
+    next = next[prop]
+    if (
+      typeof next === `string` ||
+      typeof next === `number` ||
+      typeof next === `boolean`
+    ) {
+      // Add to chain so we can return it
+      chain.push(next)
+      return chain
+    }
+    if (!next) {
+      // Must be null or undefined since we checked the rest above
+      return undefined
+    }
+    props = Object.getOwnPropertyNames(next)
+  }
+
+  // This means at least one object in the chain had more than one property
+  return undefined
+}
+
+/**
+ * Given the chain of a simple filter, return the set of nodes that pass the
+ * filter. The chain should be a property chain leading to the property to
+ * check, followed by the value to check against.
+ * Only nodes of given node types will be considered (a fast index is created
+ * if one doesn't exist).
+ * The empty result value is null if firstOnly is false, or else an empty array.
+ *
+ * @param {Array<string>} chain
+ * @param {boolean|number|string} targetValue
+ * @param {Array<string>} nodeTypeNames
+ * @param {boolean} firstOnly
+ * @returns {Object[]|null}
+ */
+const runFlatFilterWithoutSift = (
+  chain,
+  targetValue,
+  nodeTypeNames,
+  firstOnly
+) => {
+  ensureIndexByTypedChain(chain, nodeTypeNames)
+
+  const nodesByKeyValue = getNodesByTypedChain(
+    chain,
+    targetValue,
+    nodeTypeNames
+  )
+
+  if (chain.join(`,`) === `id`) {
+    if (nodesByKeyValue) {
+      // There are cases (and tests) where an id does not exist
+      return [nodesByKeyValue]
+    }
+  } else if (nodesByKeyValue?.size > 0) {
+    return [...nodesByKeyValue]
+  }
+
+  // If this branch couldn't find it sift might if the schema contained a proxy;
+  // `slug: String @proxy(from: "slugInternal")`
+  return undefined
+}
+
+/**
  * Filters a list of nodes using mongodb-like syntax.
  *
  * @param args raw graphql query filter as an object
@@ -123,24 +221,34 @@ function handleMany(siftArgs, nodes, sort, resolvedFields) {
  *   if `firstOnly` is true
  */
 const runSift = (args: Object) => {
-  const { getNode, addResolvedNodes, getResolvedNode } = require(`./nodes`)
+  const { nodeTypeNames, firstOnly = false } = args
 
-  const { nodeTypeNames } = args
-  if (
-    args.queryArgs?.filter &&
-    Object.getOwnPropertyNames(args.queryArgs.filter).length === 1 &&
-    typeof args.queryArgs.filter?.id?.eq === `string`
-  ) {
-    // The args have an id.eq which subsumes all other queries
-    // Since the id of every node is unique there can only ever be one node found this way. Find it and return it.
-    let id = args.queryArgs.filter.id.eq
-    let node = undefined
-    nodeTypeNames.some(typeName => {
-      node = getResolvedNode(typeName, id)
-      return !!node
-    })
-    if (node) {
-      return [node]
+  const filter = args.queryArgs?.filter
+  if (filter) {
+    // This can be any string of {a: {b: {c: {eq: "x"}}}} and we want to confirm there is exactly one leaf in this
+    // structure and that this leaf is `eq`. The actual names are irrelevant, they are props on each node.
+
+    let flatChain = getFlatPropertyChain(filter)
+    if (flatChain) {
+      // `flatChain` should now be like:
+      //   `filter = {this: {is: {the: {chain: {eq: needle}}}}}`
+      //  ->
+      //   `['this', 'is', 'the', 'chain', 'eq', needle]`
+      let targetValue = flatChain.pop()
+      let lastPath = flatChain.pop()
+
+      // This can also be `ne`, `in` or any other grapqhl comparison op
+      if (lastPath === `eq`) {
+        let result = runFlatFilterWithoutSift(
+          flatChain,
+          targetValue,
+          nodeTypeNames,
+          firstOnly
+        )
+        if (result) {
+          return result
+        }
+      }
     }
   }
 
